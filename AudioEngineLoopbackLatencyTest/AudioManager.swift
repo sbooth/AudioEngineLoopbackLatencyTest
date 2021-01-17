@@ -18,6 +18,11 @@ struct AudioManagerState {
     var audioBuffersScheduledAtHost : UInt64 = 0 //when does the original audio get played
     var inputNodeTapBeganAtHost : UInt64 = 0 //the first call to the input node tap
     var outputNodeTapBeganAtHost : UInt64 = 0 //first call to the output node tap
+
+	var outputSafetyOffset: UInt32 = 0
+	var inputSafetyOffset: UInt32 = 0
+	var outputBufferSizeFrames: UInt32 = 0
+	var inputBufferSizeFrames: UInt32 = 0
 }
 
 class AudioManager : ObservableObject {
@@ -92,6 +97,7 @@ extension AudioManager {
         installTapOnOutputNode()
         
         audioEngine.prepare()
+		getDeviceProperties()
     }
     
     func setupAudioSession() {
@@ -113,6 +119,64 @@ extension AudioManager {
         }
         #endif
     }
+
+	func getDeviceProperties() {
+		#if os(macOS)
+		var status: OSStatus = noErr
+
+		let inputNodeID = audioEngine.inputNode.auAudioUnit.deviceID
+		let outputNodeID = audioEngine.outputNode.auAudioUnit.deviceID
+
+		var pa = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertySafetyOffset,
+										mScope: kAudioObjectPropertyScopeOutput,
+										mElement: kAudioObjectPropertyElementMaster)
+		var answerSize = UInt32(MemoryLayout<UInt32>.size)
+		var answer: UInt32 = 0
+		status = AudioObjectGetPropertyData(outputNodeID, &pa, 0, nil, &answerSize, &answer)
+		if status != noErr {
+			fatalError("Error: \(status)")
+		}
+		print("kAudioDevicePropertySafetyOffset (output -- output scope): \(answer)")
+		state.outputSafetyOffset = answer
+
+		pa = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertySafetyOffset,
+										mScope: kAudioObjectPropertyScopeInput,
+										mElement: kAudioObjectPropertyElementMaster)
+		answerSize = UInt32(MemoryLayout<UInt32>.size)
+		answer = 0
+		status = AudioObjectGetPropertyData(inputNodeID, &pa, 0, nil, &answerSize, &answer)
+		if status != noErr {
+			fatalError("Error: \(status)")
+		}
+		print("kAudioDevicePropertySafetyOffset (input -- input scope): \(answer)")
+		state.inputSafetyOffset = answer
+
+		pa = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyBufferFrameSize,
+										mScope: kAudioObjectPropertyScopeOutput,
+										mElement: kAudioObjectPropertyElementMaster)
+		answerSize = UInt32(MemoryLayout<UInt32>.size)
+		answer = 0
+		status = AudioObjectGetPropertyData(outputNodeID, &pa, 0, nil, &answerSize, &answer)
+		if status != noErr {
+			fatalError("Error: \(status)")
+		}
+		print("kAudioDevicePropertyBufferFrameSize (output -- output scope): \(answer)")
+		state.outputBufferSizeFrames = answer
+
+		pa = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyBufferFrameSize,
+										mScope: kAudioObjectPropertyScopeInput,
+										mElement: kAudioObjectPropertyElementMaster)
+		answerSize = UInt32(MemoryLayout<UInt32>.size)
+		answer = 0
+		status = AudioObjectGetPropertyData(inputNodeID, &pa, 0, nil, &answerSize, &answer)
+		if status != noErr {
+			fatalError("Error: \(status)")
+		}
+		print("kAudioDevicePropertyBufferFrameSize (input -- input scope): \(answer)")
+		state.inputBufferSizeFrames = answer
+
+		#endif
+	}
 }
 
 /* SCHEDULING OF BUFFERS DURING INITIAL PLAYBACK */
@@ -239,12 +303,20 @@ extension AudioManager {
         let outputNodeHostTimeDiff = Int64(state.outputNodeTapBeganAtHost) - Int64(timestampToSyncTo)
         
         //Since we're going to schedule the audio files in an offline render, conver these host time shifts to sample times
-        let inputNodeDiffInSamples = Double(inputNodeHostTimeDiff) / state.secondsToTicks * inputFileBuffer.format.sampleRate
-        print("Input frame offset in samples: \(inputNodeDiffInSamples)")
-        
-        let outputNodeDiffInSamples = Double(outputNodeHostTimeDiff) / state.secondsToTicks * outputFileBuffer.format.sampleRate
-        print("Output frame offset in samples: \(outputNodeDiffInSamples)")
-        
+		let inputNodeDiffInSeconds = Double(inputNodeHostTimeDiff) / state.secondsToTicks
+		let inputNodeDiffInSamples = inputNodeDiffInSeconds * inputFileBuffer.format.sampleRate
+		print("Input frame offset in seconds: \(inputNodeDiffInSeconds)")
+		print("Input frame offset in samples: \(inputNodeDiffInSamples)")
+		print("Adjusted input frame offset in seconds: \(inputNodeDiffInSeconds + 0.33)")
+		print("Adjusted input frame offset in samples: \((inputNodeDiffInSeconds + 0.33) * inputFileBuffer.format.sampleRate)")
+
+		let outputNodeDiffInSeconds = Double(outputNodeHostTimeDiff) / state.secondsToTicks
+		let outputNodeDiffInSamples = outputNodeDiffInSeconds * outputFileBuffer.format.sampleRate
+		print("Output frame offset in seconds: \(outputNodeDiffInSeconds)")
+		print("Output frame offset in samples: \(outputNodeDiffInSamples)")
+		print("Adjusted output frame offset in seconds: \(outputNodeDiffInSeconds + 0.33)")
+		print("Adjusted output frame offset in samples: \((outputNodeDiffInSeconds + 0.33) * outputFileBuffer.format.sampleRate)")
+
         /*
          Note:
          I've attempted to use various latency values here as well to compensate (ie AVAudioSession's inputLatency, outputLatency, ioBufferDuration),
@@ -272,15 +344,16 @@ extension AudioManager {
         }
         
         //play the tap of the output node at its determined sync time -- note that this seems to line up in the result file
-        let outputAudioTime = AVAudioTime(sampleTime: AVAudioFramePosition(outputNodeDiffInSamples),
-                                          atRate: renderingEngine.mainMixerNode.outputFormat(forBus: 0).sampleRate)
+		let delay = 0.33
+		let outputAudioTime = AVAudioTime(sampleTime: AVAudioFramePosition(recordedOutputNodePlayer.outputFormat(forBus: 0).sampleRate * -delay) + Int64(state.inputBufferSizeFrames + state.outputBufferSizeFrames + state.outputSafetyOffset),
+										  atRate: recordedOutputNodePlayer.outputFormat(forBus: 0).sampleRate)
         recordedOutputNodePlayer.scheduleBuffer(outputFileBuffer, at: outputAudioTime, options: []) {
             print("Output buffer played")
         }
         
         //play the tap of the input node at its determined sync time -- this _does not_ appear to line up in the result file
-        let inputAudioTime = AVAudioTime(sampleTime: AVAudioFramePosition(inputNodeDiffInSamples),
-                                         atRate: renderingEngine.mainMixerNode.outputFormat(forBus: 0).sampleRate)
+		let inputAudioTime = AVAudioTime(sampleTime: AVAudioFramePosition(recordedInputNodePlayer.outputFormat(forBus: 0).sampleRate * -delay) - Int64(state.inputSafetyOffset),
+										 atRate: renderingEngine.mainMixerNode.outputFormat(forBus: 0).sampleRate)
         recordedInputNodePlayer.scheduleBuffer(inputFileBuffer, at: inputAudioTime, options: []) {
             print("Input buffer played")
         }
