@@ -11,6 +11,8 @@ import AudioToolbox
 import Accelerate
 import CoreAudio
 
+let startDelay = 0.1
+
 struct AudioManagerState {
     var secondsToTicks : Double = calculateSecondsToTicks()
     
@@ -21,6 +23,10 @@ struct AudioManagerState {
 
 	var outputSafetyOffset: UInt32 = 0
 	var inputSafetyOffset: UInt32 = 0
+	var outputLatency: UInt32 = 0
+	var inputLatency: UInt32 = 0
+	var outputStreamLatency: UInt32 = 0
+	var inputStreamLatency: UInt32 = 0
 	var outputBufferSizeFrames: UInt32 = 0
 	var inputBufferSizeFrames: UInt32 = 0
 }
@@ -151,6 +157,30 @@ extension AudioManager {
 		print("kAudioDevicePropertySafetyOffset (input -- input scope): \(answer)")
 		state.inputSafetyOffset = answer
 
+		pa = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyLatency,
+										mScope: kAudioObjectPropertyScopeOutput,
+										mElement: kAudioObjectPropertyElementMaster)
+		answerSize = UInt32(MemoryLayout<UInt32>.size)
+		answer = 0
+		status = AudioObjectGetPropertyData(outputNodeID, &pa, 0, nil, &answerSize, &answer)
+		if status != noErr {
+			fatalError("Error: \(status)")
+		}
+		print("kAudioDevicePropertyLatency (output - output scope): \(answer)")
+		state.outputLatency = answer
+
+		pa = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyLatency,
+										mScope: kAudioObjectPropertyScopeInput,
+										mElement: kAudioObjectPropertyElementMaster)
+		answerSize = UInt32(MemoryLayout<UInt32>.size)
+		answer = 0
+		status = AudioObjectGetPropertyData(inputNodeID, &pa, 0, nil, &answerSize, &answer)
+		if status != noErr {
+			fatalError("Error: \(status)")
+		}
+		print("kAudioDevicePropertyLatency (input -- input scope): \(answer)")
+		state.inputLatency = answer
+
 		pa = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyBufferFrameSize,
 										mScope: kAudioObjectPropertyScopeOutput,
 										mElement: kAudioObjectPropertyElementMaster)
@@ -175,6 +205,59 @@ extension AudioManager {
 		print("kAudioDevicePropertyBufferFrameSize (input -- input scope): \(answer)")
 		state.inputBufferSizeFrames = answer
 
+		var streamsSize: UInt32 = 0
+
+		pa = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyStreams, mScope: kAudioObjectPropertyScopeOutput, mElement: kAudioObjectPropertyElementMaster)
+		status = AudioObjectGetPropertyDataSize(outputNodeID, &pa, 0, nil, &streamsSize)
+		guard  status == noErr else {
+			fatalError("Status: \(status)")
+		}
+		var numStreams: UInt32 = streamsSize / UInt32(MemoryLayout<AudioStreamID>.stride)
+		var streams = [AudioStreamID](repeating: 0, count: Int(numStreams))
+		status = AudioObjectGetPropertyData(outputNodeID, &pa, 0, nil, &streamsSize, &streams)
+		guard  status == noErr else {
+			fatalError("Status: \(status)")
+		}
+
+		for stream in streams {
+			pa = AudioObjectPropertyAddress(mSelector: kAudioStreamPropertyLatency,
+											mScope: kAudioObjectPropertyScopeOutput,
+											mElement: kAudioObjectPropertyElementMaster)
+			pa.mSelector = kAudioStreamPropertyLatency
+			answerSize = UInt32(MemoryLayout<UInt32>.size)
+			answer = 0
+			status = AudioObjectGetPropertyData(stream, &pa, 0, nil, &answerSize, &answer)
+			guard  status == noErr else {
+				fatalError("Status: \(status)")
+			}
+			print("kAudioStreamPropertyLatency (stream 0x\(String(stream, radix: 16, uppercase: false)) output): \(answer)")
+			state.outputStreamLatency = answer
+		}
+
+		pa = AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyStreams, mScope: kAudioObjectPropertyScopeInput, mElement: kAudioObjectPropertyElementMaster)
+		status = AudioObjectGetPropertyDataSize(outputNodeID, &pa, 0, nil, &streamsSize)
+		guard  status == noErr else {
+			fatalError("Status: \(status)")
+		}
+		numStreams = streamsSize / UInt32(MemoryLayout<AudioStreamID>.stride)
+		streams = [AudioStreamID](repeating: 0, count: Int(numStreams))
+		status = AudioObjectGetPropertyData(inputNodeID, &pa, 0, nil, &streamsSize, &streams)
+		guard  status == noErr else {
+			fatalError("Status: \(status)")
+		}
+
+		for stream in streams {
+			pa = AudioObjectPropertyAddress(mSelector: kAudioStreamPropertyLatency, mScope: kAudioObjectPropertyScopeInput, mElement: kAudioObjectPropertyElementMaster)
+			answerSize = UInt32(MemoryLayout<UInt32>.size)
+			answer = 0
+			status = AudioObjectGetPropertyData(stream, &pa, 0, nil, &answerSize, &answer)
+			guard  status == noErr else {
+				fatalError("Status: \(status)")
+			}
+			print("kAudioStreamPropertyLatency (stream 0x\(String(stream, radix: 16, uppercase: false)) input): \(answer)")
+			state.inputStreamLatency = answer
+		}
+
 		#endif
 	}
 }
@@ -187,7 +270,7 @@ extension AudioManager {
         }
         
         //delay the playback of the initial buffer so that we're not trying to play immediately when the engine starts
-        let delay = 0.33 * state.secondsToTicks
+        let delay = startDelay * state.secondsToTicks
         let audioTime = AVAudioTime(hostTime: mach_absolute_time() + UInt64(delay))
         state.audioBuffersScheduledAtHost = audioTime.hostTime
         
@@ -289,71 +372,62 @@ extension AudioManager {
         }
         
         /* ---------------------------------------------- DETERMINE SYNC -------------------------------------- */
-        print("Original buffers were scheduled at: \(state.audioBuffersScheduledAtHost)")
-        print("Input node started at: \(state.inputNodeTapBeganAtHost)")
-        print("Output node started at: \(state.outputNodeTapBeganAtHost)")
-        
-        //Try to move the input/output files so that they are synced to the timing of the original audio buffer
-        let timestampToSyncTo = state.audioBuffersScheduledAtHost
-        
-        //Find the difference between the first call of the input/output node taps and the time to sync to
-        //For example, if the original audio was scheduled at 1_000_000_000 and the input node tap started at 900_000_000,
-        //the input audio file should be shifted left by 100_000_000 in order to line up
-        let inputNodeHostTimeDiff = Int64(state.inputNodeTapBeganAtHost) - Int64(timestampToSyncTo)
-        let outputNodeHostTimeDiff = Int64(state.outputNodeTapBeganAtHost) - Int64(timestampToSyncTo)
-        
-        //Since we're going to schedule the audio files in an offline render, conver these host time shifts to sample times
-		let inputNodeDiffInSeconds = Double(inputNodeHostTimeDiff) / state.secondsToTicks
-		let inputNodeDiffInSamples = inputNodeDiffInSeconds * inputFileBuffer.format.sampleRate
-		print("Input frame offset in seconds: \(inputNodeDiffInSeconds)")
-		print("Input frame offset in samples: \(inputNodeDiffInSamples)")
-		print("Adjusted input frame offset in seconds: \(inputNodeDiffInSeconds + 0.33)")
-		print("Adjusted input frame offset in samples: \((inputNodeDiffInSeconds + 0.33) * inputFileBuffer.format.sampleRate)")
 
-		let outputNodeDiffInSeconds = Double(outputNodeHostTimeDiff) / state.secondsToTicks
-		let outputNodeDiffInSamples = outputNodeDiffInSeconds * outputFileBuffer.format.sampleRate
-		print("Output frame offset in seconds: \(outputNodeDiffInSeconds)")
-		print("Output frame offset in samples: \(outputNodeDiffInSamples)")
-		print("Adjusted output frame offset in seconds: \(outputNodeDiffInSeconds + 0.33)")
-		print("Adjusted output frame offset in samples: \((outputNodeDiffInSeconds + 0.33) * outputFileBuffer.format.sampleRate)")
-
-        /*
-         Note:
-         I've attempted to use various latency values here as well to compensate (ie AVAudioSession's inputLatency, outputLatency, ioBufferDuration),
-         but they yield wildly different results on different systems.  On my mac, using ioBufferDuration alone gets close to lining things up.
-         On my iPhone, ioBufferDuration pushes it further out of sync.
-         
-         And, the AVAudioSession APIs aren't available on macOS, making me thing perhaps there's a way to do this with AVAudioEngine.
-         However, in Catalyst, all AVAudioNode latency values (latency, presentationLatency, etc) seem to report 0.0
-         */
-        
         //pan the nodes so that the result file is visually easy to see the sync on by comparing the waveforms of the channels
         originalAudioPlayerNode.pan = -1.0
         recordedOutputNodePlayer.pan = -1.0
         recordedInputNodePlayer.pan = 1.0
-        
-        
+
         originalAudioPlayerNode.play()
         recordedInputNodePlayer.play()
         recordedOutputNodePlayer.play()
-        
+
+		// The following computations work with the built-in audio on my MBP, presumably because the devices report accurate
+		// latencies. The following values are what is reported for the aggregate device created by AVAudioEngine:
+
+		// Output:
+		// kAudioDevicePropertySafetyOffset:    144
+		// kAudioDevicePropertyLatency:          11
+		// kAudioStreamPropertyLatency:         424
+		// kAudioDevicePropertyBufferFrameSize: 512
+
+		// Input:
+		// kAudioDevicePropertySafetyOffset:     154
+		// kAudioDevicePropertyLatency:            0
+		// kAudioStreamPropertyLatency:         2404
+		// kAudioDevicePropertyBufferFrameSize:  512
+
+		// It's possible that the results work by coincidence! The computations below don't work with my display's
+		// audio. Further testing is required.
+
+		// If the input and output devices are at different sample rates the math will need to be fixed.
+
+		// The original audio file start time
+		let originalStartingFrame: AVAudioFramePosition = AVAudioFramePosition(playerNode.outputFormat(forBus: 0).sampleRate * startDelay)
+		// The output tap's first sample was delivered to the device after the buffer was filled once
+		// A number of zero samples equal to the buffer size is produced initially
+		let outputStartingFrame: AVAudioFramePosition = Int64(state.outputBufferSizeFrames)
+		// The first output sample makes it way back into the input tap after accounting for all the latencies
+		let inputStartingFrame: AVAudioFramePosition = outputStartingFrame - Int64(state.outputLatency + state.outputStreamLatency + state.outputSafetyOffset + state.inputSafetyOffset + state.inputLatency + state.inputStreamLatency)
+
+		print("originalStartingFrame = \(originalStartingFrame)")
+		print("outputStartingFrame = \(outputStartingFrame)")
+		print("inputStartingFrame = \(inputStartingFrame)")
+
         //play the original metronome audio at sample position 0 and try to sync everything else up to it
-        let originalAudioTime = AVAudioTime(sampleTime: 0, atRate: renderingEngine.mainMixerNode.outputFormat(forBus: 0).sampleRate)
+        let originalAudioTime = AVAudioTime(sampleTime: originalStartingFrame, atRate: renderingEngine.mainMixerNode.outputFormat(forBus: 0).sampleRate)
         originalAudioPlayerNode.scheduleBuffer(metronomeFileBuffer, at: originalAudioTime, options: []) {
             print("Played original audio")
         }
         
         //play the tap of the output node at its determined sync time -- note that this seems to line up in the result file
-		let delay = 0.33
-		let outputAudioTime = AVAudioTime(sampleTime: AVAudioFramePosition(recordedOutputNodePlayer.outputFormat(forBus: 0).sampleRate * -delay) + Int64(state.inputBufferSizeFrames + state.outputBufferSizeFrames + state.outputSafetyOffset),
-										  atRate: recordedOutputNodePlayer.outputFormat(forBus: 0).sampleRate)
+		let outputAudioTime = AVAudioTime(sampleTime: outputStartingFrame, atRate: recordedOutputNodePlayer.outputFormat(forBus: 0).sampleRate)
         recordedOutputNodePlayer.scheduleBuffer(outputFileBuffer, at: outputAudioTime, options: []) {
             print("Output buffer played")
         }
         
         //play the tap of the input node at its determined sync time -- this _does not_ appear to line up in the result file
-		let inputAudioTime = AVAudioTime(sampleTime: AVAudioFramePosition(recordedInputNodePlayer.outputFormat(forBus: 0).sampleRate * -delay) - Int64(state.inputSafetyOffset),
-										 atRate: renderingEngine.mainMixerNode.outputFormat(forBus: 0).sampleRate)
+		let inputAudioTime = AVAudioTime(sampleTime: inputStartingFrame, atRate: renderingEngine.mainMixerNode.outputFormat(forBus: 0).sampleRate)
         recordedInputNodePlayer.scheduleBuffer(inputFileBuffer, at: inputAudioTime, options: []) {
             print("Input buffer played")
         }
